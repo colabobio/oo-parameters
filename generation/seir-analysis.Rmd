@@ -1,7 +1,7 @@
 ---
 title: "SEIR simulations for OO"
 author: "Andres Colubri"
-date: "11/15/2020"
+date: "11/01/2022"
 output:
   html_document:
     df_print: paged
@@ -32,16 +32,7 @@ stopifnot(packageVersion("pomp")>="2")
 DATA
 
 ```{r}
-# main_folder <- "./fgcu"
-#main_folder <- "./latech"
-#main_folder <- "./cmu"
-#main_folder <- "./csw1"
-#main_folder <- "./csw2"
-#main_folder <- "./byu"
-#main_folder <- "./byu21"
-#main_folder <- "./ucas21"
-main_folder <- "./herricane"
-main_folder <- "./wjhs22"
+main_folder <- "./simulations/rowan22"
 
 prop_file = file.path(main_folder, "sim.properties")
 prop <- read.properties(prop_file)
