@@ -1,0 +1,484 @@
+---
+title: "SEIR simulations for OO"
+author: "Andres Colubri"
+date: "11/15/2020"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(doRNG)
+library(foreach)
+library(doParallel)
+library(boot)
+library(properties)
+
+# tidyr has to be imported before magrittr so extract() from the latter is used
+library(tidyr)
+
+library(dplyr)
+library(plyr)
+library(reshape2)
+library(magrittr)
+
+library(ggplot2)
+theme_set(theme_bw())
+
+library(pomp)
+stopifnot(packageVersion("pomp")>="2")
+```
+
+DATA
+
+```{r}
+# main_folder <- "./fgcu"
+#main_folder <- "./latech"
+#main_folder <- "./cmu"
+#main_folder <- "./csw1"
+#main_folder <- "./csw2"
+#main_folder <- "./byu"
+#main_folder <- "./byu21"
+#main_folder <- "./ucas21"
+main_folder <- "./herricane"
+main_folder <- "./wjhs22"
+
+prop_file = file.path(main_folder, "sim.properties")
+prop <- read.properties(prop_file)
+
+output_name <- prop$output_name
+output_folder <- file.path(main_folder, output_name)
+if (!dir.exists(output_folder)) dir.create(output_folder)
+cooking_folder <- file.path(main_folder, output_name, "bake")
+if (!dir.exists(cooking_folder)) dir.create(cooking_folder)
+plotting_folder <- file.path(main_folder, output_name, "plots")
+if (!dir.exists(plotting_folder)) dir.create(plotting_folder)
+code_folder <- file.path(main_folder, "code")
+if (!dir.exists(code_folder)) dir.create(code_folder)
+file_name <- "snippets"
+```
+
+PARAMETERS
+
+```{r}
+
+pop_size <- as.integer(as.numeric(prop$pop_size) * as.numeric(prop$susc_frac))
+exp0 <- as.integer(prop$exp0)
+inf0 <- as.integer(prop$inf0)
+rec0 <- as.integer(prop$rec0)
+
+time_step <-as.numeric(prop$time_step)
+num_sims <- as.integer(prop$num_sims)
+
+total_time <- as.integer(prop$total_time)
+
+log_trans_params <- c("beta", "psi")
+logit_trans_params <- c("gamma", "rho")
+
+all_param_names <- c("pop", "S_0", "E_0", "I_0", "R_0", 
+                     "beta", "gamma", "sigma", "rho", "psi")
+all_param_values <- c(pop=pop_size, 
+                      S_0=1-(exp0+inf0+rec0)/pop_size, E_0=exp0/pop_size, I_0=inf0/pop_size, R_0=rec0/pop_size, 
+                      beta=as.numeric(prop$beta),
+                      gamma=as.numeric(prop$gamma),
+                      sigma=as.numeric(prop$sigma),
+                      rho=as.numeric(prop$rho),
+                      psi=as.numeric(prop$psi))
+
+# Random seeds, keep unchanged to ensure reproducibilty of results
+test_sim_seed <- as.integer(prop$test_sim_seed)
+full_sim_seed <- as.integer(prop$full_sim_seed)
+```
+
+COMPARTMENTAL MODEL
+
+```{r}
+# Csnippets defining the SEIR model
+
+# pomp C API:
+# https://kingaa.github.io/pomp/vignettes/C_API.html
+
+rproc <- Csnippet("
+  double rate[3], trans[3];
+
+  rate[0] = beta * I/pop;
+  rate[1] = sigma;
+  rate[2] = gamma;
+
+  // transitions between classes
+  reulermultinom(1, S, &rate[0], dt, &trans[0]);
+  reulermultinom(1, E, &rate[1], dt, &trans[1]);
+  reulermultinom(1, I, &rate[2], dt, &trans[2]);
+
+  S += -trans[0];
+  E += trans[0] - trans[1];
+  I += trans[1] - trans[2];
+  R += trans[2];
+
+  // Assigning the right number to the accumulation variable that's used
+  // in the observation model is absolutely critical!!!!
+  C += trans[2]; // We are observing the number of infectious cases that get quarantined when identified
+")
+
+initlz <- Csnippet("
+  double m = pop/(S_0 + E_0 + I_0 + R_0);
+
+  S = nearbyint(m*S_0);
+  E = nearbyint(m*E_0);
+  I = nearbyint(m*I_0);
+  R = nearbyint(m*R_0);
+
+  C = 0;
+")
+
+dmeas <- Csnippet("
+  double m = rho * C;
+  double v = m * (1.0 - rho + psi * psi * m);
+  double tol = 1.0e-18;
+  if (cases > 0.0) {
+    lik = pnorm(cases + 0.5, m, sqrt(v) + tol, 1, 0) - pnorm(cases - 0.5, m, sqrt(v)  + tol, 1, 0) + tol;
+  } else {
+    lik = pnorm(cases + 0.5, m, sqrt(v) + tol, 1, 0) + tol;
+  }
+  if (give_log) lik = log(lik);
+")
+
+rmeas <- Csnippet("
+  double m = rho * C;
+  double v = m * (1.0 - rho + psi * psi * m);
+  double tol = 1.0e-18;
+  cases = rnorm(m, sqrt(v) + tol);
+  if (cases > 0.0) {
+    cases = nearbyint(cases);
+  } else {
+    cases = 0.0;
+  }
+")
+```
+
+```{r}
+# POMP model
+simulate(t0=0, times=1:total_time,
+         rprocess=euler(rproc, delta.t=time_step),
+         rinit=initlz,
+         rmeasure=rmeas,
+         dmeasure=dmeas,
+         cdir = code_folder,
+         cfile = file_name,       
+         accumvars=c("C"),
+         statenames=c("S", "E", "I", "R", "C"),
+         obsnames=c("cases"),
+         partrans=parameter_trans(
+           log=log_trans_params,
+           logit=logit_trans_params),
+         paramnames=all_param_names,
+         params=all_param_values,
+         verbose = TRUE
+) -> mdl_sim
+
+mdl_sim %>% as.data.frame() %>%
+  melt(id="time") %>%
+  ggplot(aes(x=time, y=value)) +
+  geom_line() +
+  xlab(prop$time_unit) +
+  facet_grid(variable~.,scales="free_y")
+```
+
+SIMULATIONS
+
+```{r}
+# Some utility functions to calculate cumulative case numbers
+
+rem_low_count_simulations <- function(sdat, n) {
+  wlim <- 2
+  wday <- 7
+  
+  all_totals <- c()
+  for (i in 1:n) {
+    sim <- subset(sdat, .id == i)
+    tot <- sum(sim$cases)
+    sim$week <- floor(sim$time/wday)
+    wdat <- data.frame(week = sim$week, cases = sim$cases)
+    wdat <- group_by(wdat, week)
+
+    wcases <- c()
+    for (w in unique(wdat$week)){
+      temp <- subset(wdat, week == w)
+      wcases <- c(wcases, sum(temp$cases))
+    }
+    wdat <- data.frame(week = unique(wdat$week), cases = wcases)
+    if (any(wcases[1:(length(wcases)-wlim)] == 0)) {
+      sdat <- subset(sdat, .id != i)
+    } else{
+      all_totals <-  c(all_totals, tot)
+    }
+  }
+  #print(mean(all_totals))
+  
+  # Make ids consecutive
+  uniq <- unique(sdat$.id)
+  uid <- 1
+  for (u in uniq) {
+    if (u == 'data') next
+    sdat$.id[sdat$.id == u] <- uid
+    uid <- uid + 1  
+  }
+  
+  return(sdat)
+}
+
+cumulative_curve <- function(dat, len) {
+  total_sum <- 0
+  daily_sum <- c()
+  for (i in 1:len) {
+    total_sum <- total_sum + dat$cases[i]
+    daily_sum <- c(daily_sum, total_sum)
+  }
+  return(daily_sum)
+}  
+  
+median_simulation <- function(sdat, n) {
+  all_totals <- c()
+  for (i in 1:n) {
+    sim <- subset(sdat, .id == i)
+    tot <- sum(sim$cases)
+    all_totals <- c(all_totals, tot)
+  }
+
+  # Taking the median
+  n2 <- 0.5 * n
+  median_idx <- order(all_totals)[n2]
+  median_sim <- subset(sdat, .id == median_idx)
+  
+  return(median_sim)
+}
+
+calc_cumulative_counts <- function(sdat, len) {
+  all_csum <- c()
+  csum <- NULL
+  for (t in 1:len) {
+    dt <- subset(sdat, .id != "data" & time == t)
+    if (is.null(csum)) {
+      csum <- dt$cases
+    } else {
+      csum <- csum + dt$cases
+    }
+    
+    all_csum <- c(all_csum, csum)
+  }
+  return(all_csum)
+}
+```
+
+```{r}
+#set.seed(test_sim_seed)
+
+mdl_sim  %>%
+  simulate(nsim=num_sims) -> sim_data
+
+ggplot(data=gather(
+  as.data.frame(sim_data),
+  variable, value, cases, S, E, I, R, C
+),
+  aes(x=time,y=value,color=variable,
+    group=interaction(.id,variable))) +
+  geom_line() +
+  facet_grid(variable~.,scales="free_y") +
+  xlab(prop$time_unit) + 
+  labs(y="",color="")
+
+ggsave(file.path(plotting_folder, "3-simulations.pdf"))
+```
+
+CODE TO REVISE AND INCORPORATE LATER (INTERVENTIONS, ETC..)
+
+PLOT HARVARD OUTBREAK WITHOUT INTERVENTION
+
+```{r}
+theta_noq <- theta
+theta_noq["q"] <- 1
+```
+
+```{r}
+#set.seed(test_sim_seed)
+
+mdl_int  %>%
+  simulate(params=theta_noq, nsim=9, format="data.frame", include.data=TRUE) -> sim_data_noq
+
+sim_data_noq %>%
+  ggplot(aes(x=time, y=cases, group=.id, color=(.id=="data"))) +
+  guides(color=FALSE) +
+  geom_line() + facet_wrap(~.id, ncol=2)
+
+ggsave(file.path(plotting_folder, "3-simulations_noint.pdf"))
+```
+
+COMPARE CUMULATIVE NUMBERS OF OUTBREAK W/ AND W/O INTERVENTION
+
+```{r}
+# Running a large number of simulations with and without intervention
+
+set.seed(full_sim_seed)
+
+mdl_int %>% 
+  simulate(params=theta, nsim=num_sims, format = "data.frame", include.data=TRUE) %>% 
+  rem_low_count_simulations(num_sims) -> sim_data_int
+
+mdl_int %>% 
+  simulate(params=theta_noq, nsim=num_sims, format = "data.frame", include.data=TRUE) %>%  
+  rem_low_count_simulations(num_sims) -> sim_data_noint
+
+# Adding cumulative counts
+cobs <- cumulative_curve(data, total_time)
+
+all_csum <- calc_cumulative_counts(sim_data_int, total_time)
+all_csum <- c(cobs, all_csum)
+sim_data_int <- cbind(sim_data_int, cumulative=all_csum)
+
+all_csum <- calc_cumulative_counts(sim_data_noint, total_time)
+all_csum <- c(cobs, all_csum)
+sim_data_noint <- cbind(sim_data_noint, cumulative=all_csum)
+```
+
+```{r}
+# Compare the observed data with the simulated data between the 5th and 95th percentiles
+case_area_plot <- function(sdat, fname) {
+  sdat %>%
+    select(time, .id, cases) %>%
+    mutate(data=.id=="data") %>%
+    ddply(~time+data, plyr::summarize,
+      p=c(0.05, 0.5, 0.95), q=quantile(cases, prob=p, names=FALSE)) %>%
+    mutate(
+      p=mapvalues(p, from=c(0.05, 0.5, 0.95), to=c("lo", "med", "hi")),
+      data=mapvalues(data, from=c(TRUE, FALSE), to=c("data", "simulation"))
+    ) %>%
+    spread(p, q) %>%
+    ggplot(aes(x=time, y=med, color=data, fill=data, ymin=lo, ymax=hi)) +
+           geom_ribbon(alpha=0.2)
+  ggsave(file.path(plotting_folder, fname))  
+}
+
+case_area_plot(sim_data_int, "4-simulated_percentiles-with_int.pdf")
+case_area_plot(sim_data_noint, "4-simulated_percentiles-wout_int.pdf")
+```
+
+```{r}
+# Getting the median cumulative curve for simulated data with intervention
+
+num_sims_int <- length(unique(sim_data_int$.id)) - 1
+sim_int <- median_simulation(sim_data_int, num_sims_int)
+csim_int <- cumulative_curve(sim_int, total_time)
+
+# Getting the median cumulative curve for the simulations w/out interventionsim_noint <- median_simulation(sim_data_noint, num_sims)
+num_sims_noint <- length(unique(sim_data_noint$.id)) - 1
+sim_noint <- median_simulation(sim_data_noint, num_sims_noint)
+csim_noint <- cumulative_curve(sim_noint, total_time)
+
+df <- data.frame('time' = seq(1, total_time), 
+                 'obs_data' = cobs,
+                 'sim_data_int' = csim_int,
+                 'sim_data_noint' = csim_noint)
+
+ggplot(df, aes(time)) + 
+  geom_line(aes(y = obs_data, colour = "Real Data")) + 
+  geom_line(aes(y = sim_data_int, colour = "Simulation with Intervention")) +
+  geom_line(aes(y = sim_data_noint, colour = "Simulation without Intervention")) +
+  geom_vline(xintercept = new_diag_day, colour = 'black', linetype = 3)  + 
+  ylab('Cumulative Number of Cases')
+
+ggsave(file.path(plotting_folder, "4-cumulative_cases_median-comparison.pdf"))
+```
+
+```{r}
+# Compare the observed cumulative counts with the simulated counts between the 5th and 95th percentiles 
+cumulative_area_plot <- function(sdat, ymax, fname) {
+  sdat %>%
+    select(time, .id, cumulative) %>%
+    mutate(data=.id=="data") %>%
+    ddply(~time+data, plyr::summarize,
+      p=c(0.05, 0.5, 0.95), q=quantile(cumulative, prob=p, names=FALSE)) %>%
+    mutate(
+      p=mapvalues(p, from=c(0.05, 0.5, 0.95), to=c("lo", "med", "hi")),
+      data=mapvalues(data, from=c(TRUE, FALSE), to=c("data", "simulation"))
+    ) %>%
+    spread(p, q) %>%
+    ggplot(aes(x=time, y=med, color=data, fill=data, ymin=lo, ymax=hi)) + ylim(0, ymax) +
+           geom_ribbon(alpha=0.2)
+  ggsave(file.path(plotting_folder, fname))
+}
+
+cmax <- 0.8 * max(sim_data_int$cumulative, sim_data_noint$cumulative)
+cumulative_area_plot(sim_data_int, cmax, "4-cumulative_cases_percentiles-comparison-with_int.pdf")
+cumulative_area_plot(sim_data_noint, cmax, "4-cumulative_cases_percentiles-comparison-wout_int.pdf")
+```
+
+SHOW HOW OUTBREAK SIZE CHANGES (comparison to the simulation size AND actual size)
+
+```{r}
+outbreak_size <- function(intervention_day) {
+  theta_global_int_day <- theta
+  theta_global_int_day["intervention"] <- intervention_day
+  
+  mdl_int %>% 
+    simulate(params=c(theta_global_int_day), 
+             nsim=num_sims, format = "data.frame", include.data=TRUE) -> simulation_data
+
+  sizes <- c()
+  sizes_dday <- c()
+  for (i in 1:num_sims) {
+    temp <- subset(simulation_data, .id == i)
+    temp_dday <- subset(data_dday, .id == i)
+    size <- sum(temp$cases)
+    sizes <- c(sizes, size)
+    sizes_dday <- c(sizes_dday, sum(temp_dday$cases))
+  }
+  
+  actual_size <- sum(data$cases)
+
+  final_size <- mean(sizes)
+  final_size_dday <- mean(sizes_dday)
+
+  percentage <- (final_size_dday - final_size) / final_size_dday
+  percentage_2 <- (actual_size - final_size) / actual_size
+
+  return(c(final_size, percentage * 100, percentage_2 * 100))
+}
+```
+
+```{r}
+theta_dday <- theta
+theta_dday["intervention"] <- new_diag_day
+
+mdl_int %>% 
+   simulate(params=theta_dday, nsim=num_sims, format = "data.frame", include.data=TRUE) -> data_dday
+
+reduction_size = c()
+reduction_size_actual = c()
+for (i in seq(1, new_diag_day - 1, length=new_diag_day - 1)) {
+    size = outbreak_size(floor(i))
+    reduction_size = c(reduction_size, size[2])
+    reduction_size_actual = c(reduction_size_actual, size[3])
+}
+```
+
+```{r}
+red_size <- reduction_size
+#red_size <- reduction_size_actual
+
+ggplot(data.frame('time' = seq(1, new_diag_day - 1, length = new_diag_day - 1), 'reduction' = red_size),
+       aes(x = time, y = red_size)) + geom_point() + 
+       stat_smooth(aes(x = time, y = red_size), method = "lm", formula = y ~ x, se = TRUE) + 
+       ylab('Reduction (%)') + xlab('Day of Intervention') + 
+       ggtitle('Reduction in Outbreak Size')
+
+reduction_line = lm(red_size ~ time, 
+                    data = data.frame('time' = seq(1, new_diag_day - 1, length=new_diag_day - 1),
+                                      'reduction' = red_size))
+
+sink(file.path(output_folder, "reduction_fit_line.txt"))
+summary(reduction_line)
+sink()
+
+ggsave(file.path(plotting_folder, "5-outbreak_reduction.pdf"))
+```
+

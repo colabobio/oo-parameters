@@ -1,0 +1,9 @@
+**/.DS_Store
+**/*.rda
+**/*.rds
+**/.ipynb_checkpoints
+**/.Rhistory
+**/*.dylib
+
+estimation/simulations
+generation/simulations
