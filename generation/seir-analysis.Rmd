@@ -167,12 +167,10 @@ simulate(t0=0, times=1:total_time,
          verbose = TRUE
 ) -> mdl_sim
 
-mdl_sim %>% as.data.frame() %>%
-  melt(id="time") %>%
-  ggplot(aes(x=time, y=value)) +
-  geom_line() +
-  xlab(prop$time_unit) +
-  facet_grid(variable~.,scales="free_y")
+ggplot(data=pivot_longer(as(mdl_sim,"data.frame"),-time),
+  aes(x=time,y=value,color=name))+
+  geom_line()
+
 ```
 
 SIMULATIONS
@@ -267,15 +265,14 @@ calc_cumulative_counts <- function(sdat, len) {
 mdl_sim  %>%
   simulate(nsim=num_sims) -> sim_data
 
-ggplot(data=gather(
-  as.data.frame(sim_data),
-  variable, value, cases, S, E, I, R, C
-),
-  aes(x=time,y=value,color=variable,
-    group=interaction(.id,variable))) +
-  geom_line() +
-  facet_grid(variable~.,scales="free_y") +
-  xlab(prop$time_unit) + 
+ggplot(data=pivot_longer(
+         as.data.frame(sim_data),
+         c(cases, S, E, I, R, C)
+       ),
+  aes(x=time,y=value,color=name,
+    group=interaction(.L1,name)))+
+  geom_line()+
+  facet_grid(name~.,scales="free_y")+
   labs(y="",color="")
 
 ggsave(file.path(plotting_folder, "3-simulations.pdf"))
