@@ -5,6 +5,5 @@
 **/.Rhistory
 **/*.dylib
 **/~$par-calculator.xlsx
-
-estimation/simulations
-generation/simulations
+**/code
+**/bake
