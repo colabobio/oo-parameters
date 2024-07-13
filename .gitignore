@@ -4,6 +4,7 @@
 **/.ipynb_checkpoints
 **/.Rhistory
 **/*.dylib
+**/~$par-calculator.xlsx
 
 estimation/simulations
 generation/simulations
