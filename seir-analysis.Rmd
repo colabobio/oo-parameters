@@ -150,7 +150,7 @@ rmeas <- Csnippet("
 set.seed(test_sim_seed)
 
 # POMP model
-simulate(t0=0, times=1:total_time,
+simulate(t0=0, times=0:total_time,
          rprocess=euler(rproc, delta.t=time_step),
          rinit=initlz,
          rmeasure=rmeas,
