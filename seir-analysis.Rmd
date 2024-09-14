@@ -32,7 +32,7 @@ stopifnot(packageVersion("pomp")>="2")
 DATA
 
 ```{r}
-main_folder <- "./simulations/diseasex"
+main_folder <- "./simulations/hpai"
 
 prop_file = file.path(main_folder, "sim.properties")
 prop <- read.properties(prop_file)
